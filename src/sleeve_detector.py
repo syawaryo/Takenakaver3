@@ -1,8 +1,9 @@
 """
-スリーブ検出（連結成分方式）
+スリーブ検出（HSV連結成分 + HoughCircles 併用）
 
-HSV青フィルタ → ハッチング除去 → 連結成分分析
-→ 各連結成分から丸い部分=スリーブ座標、残り=テキスト領域
+方式A: HSV青フィルタ → 連結成分 → 円形度判定（従来）
+方式B: グレースケール HoughCircles → 青色判定（新規）
+両方の結果をマージして重複除去。
 """
 
 from __future__ import annotations
@@ -18,42 +19,21 @@ from models import BBox, PixelPoint, SleeveCircle
 
 @dataclass
 class SleeveDetection:
-    """連結成分から検出したスリーブ1個分"""
+    """検出したスリーブ1個分"""
     circle: SleeveCircle
-    text_bbox: Optional[BBox]  # テキスト領域
-    component_bbox: BBox       # 連結成分全体のBBox
+    text_bbox: Optional[BBox]
+    component_bbox: BBox
 
 
-def _find_most_circular_contour(
-    contours: list[np.ndarray],
-    min_area: float = 20.0,
-) -> Optional[tuple[PixelPoint, float, float]]:
-    """輪郭群から最も円形度の高いものを返す。"""
-    best = None
-    best_circ = 0.0
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area:
-            continue
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        if circularity > best_circ:
-            best_circ = circularity
-            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-            best = (PixelPoint(x=cx, y=cy), radius, circularity)
-
-    return best
-
+# ==========================================================================
+# 方式A: HSV連結成分方式（従来）
+# ==========================================================================
 
 def _find_all_circular_contours(
     contours: list[np.ndarray],
     min_area: float = 20.0,
     min_circularity: float = 0.5,
 ) -> list[tuple[PixelPoint, float, float]]:
-    """輪郭群から円形度の高い全ての輪郭を返す。"""
     results = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -69,27 +49,139 @@ def _find_all_circular_contours(
     return results
 
 
-def _get_text_region_bbox(
-    component_mask: np.ndarray,
-    circle_center: PixelPoint,
-    circle_radius: float,
-) -> Optional[BBox]:
-    """連結成分マスクから丸い部分を除いた残りのBBoxを求める。"""
-    mask_no_circle = component_mask.copy()
-    cv2.circle(
-        mask_no_circle,
-        (int(circle_center.x), int(circle_center.y)),
-        int(circle_radius * 1.5),
-        0,
-        -1,
+def _detect_by_hsv_components(
+    work_img: np.ndarray,
+    hsv_lower: tuple[int, int, int],
+    hsv_upper: tuple[int, int, int],
+    min_component_area: int,
+    min_circle_area: float,
+    min_circularity: float,
+    max_radius: float,
+) -> list[tuple[PixelPoint, float, float]]:
+    """HSV青フィルタ + 連結成分で円を検出。"""
+    hsv = cv2.cvtColor(work_img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(hsv_lower), np.array(hsv_upper))
+
+    # 軽いCLOSEで近接ピクセルを結合
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    results: list[tuple[PixelPoint, float, float]] = []
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < min_component_area:
+            continue
+
+        component_mask = (labels == i).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(
+            component_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        circles = _find_all_circular_contours(contours, min_circle_area, min_circularity)
+        # 各連結成分から最も円形度の高い1つだけ採用
+        valid = [(c, r, circ) for c, r, circ in circles if r <= max_radius]
+        if valid:
+            best = max(valid, key=lambda x: x[2])
+            results.append(best)
+
+    return results
+
+
+# ==========================================================================
+# 方式B: HoughCircles方式（新規）
+# ==========================================================================
+
+def _detect_by_hough(
+    work_img: np.ndarray,
+    hsv_lower: tuple[int, int, int],
+    hsv_upper: tuple[int, int, int],
+    min_radius: int = 4,
+    max_radius: int = 20,
+    param1: int = 100,
+    param2: int = 30,
+    min_dist: int = 15,
+) -> list[tuple[PixelPoint, float, float]]:
+    """
+    グレースケールでHoughCirclesを走らせて円を検出。
+    検出後に円の周辺が青く、内部が明るい（中空）ことを判定。
+    """
+    gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+
+    # ブラーをかけてノイズ低減（HoughCirclesの前処理）
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=min_dist,
+        param1=param1,
+        param2=param2,
+        minRadius=min_radius,
+        maxRadius=max_radius,
     )
 
-    coords = cv2.findNonZero(mask_no_circle)
-    if coords is None or len(coords) < 10:
-        return None
+    if circles is None:
+        return []
 
-    x, y, w, h = cv2.boundingRect(coords)
-    return BBox(x=x, y=y, w=w, h=h)
+    # 青色マスクを作成（判定用）
+    hsv = cv2.cvtColor(work_img, cv2.COLOR_BGR2HSV)
+    blue_mask = cv2.inRange(hsv, np.array(hsv_lower), np.array(hsv_upper))
+
+    results: list[tuple[PixelPoint, float, float]] = []
+
+    for x, y, r in circles[0]:
+        x, y, r = float(x), float(y), float(r)
+
+        # 円周上の青ピクセル比率を計算
+        ring_mask = np.zeros(blue_mask.shape, dtype=np.uint8)
+        cv2.circle(ring_mask, (int(x), int(y)), int(r + 2), 255, 3)
+        ring_pixels = cv2.countNonZero(ring_mask)
+        if ring_pixels == 0:
+            continue
+        blue_on_ring = cv2.countNonZero(blue_mask & ring_mask)
+        blue_ratio = blue_on_ring / ring_pixels
+
+        # 円内部の明るさチェック（スリーブ円は中空＝白背景）
+        inner_mask = np.zeros(gray.shape, dtype=np.uint8)
+        inner_r = max(1, int(r - 2))
+        cv2.circle(inner_mask, (int(x), int(y)), inner_r, 255, -1)
+        inner_pixels = cv2.countNonZero(inner_mask)
+        if inner_pixels == 0:
+            continue
+        inner_brightness = cv2.mean(gray, mask=inner_mask)[0]
+
+        # 青比率34%以上 + 内部が明るい（200以上 = 白に近い＝中空円）
+        if blue_ratio >= 0.34 and inner_brightness >= 200:
+            circularity = min(0.85, 0.5 + blue_ratio)
+            results.append((PixelPoint(x=x, y=y), r, circularity))
+
+    return results
+
+
+# ==========================================================================
+# 統合
+# ==========================================================================
+
+def _deduplicate(detections: list[SleeveDetection], min_distance: float) -> list[SleeveDetection]:
+    if not detections:
+        return detections
+
+    detections.sort(key=lambda d: d.circle.circularity, reverse=True)
+    kept: list[SleeveDetection] = []
+    for det in detections:
+        is_dup = False
+        for k in kept:
+            dx = det.circle.center_px.x - k.circle.center_px.x
+            dy = det.circle.center_px.y - k.circle.center_px.y
+            if (dx * dx + dy * dy) ** 0.5 < min_distance:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(det)
+    return kept
 
 
 def detect_sleeves_with_annotations(
@@ -103,21 +195,7 @@ def detect_sleeves_with_annotations(
     max_radius: float = 30.0,
 ) -> list[SleeveDetection]:
     """
-    青色連結成分方式でスリーブを検出。
-
-    Parameters
-    ----------
-    img : BGR画像
-    roi : (y_start, y_end, x_start, x_end) 検出対象領域。Noneなら全体。
-    hsv_lower, hsv_upper : HSV青色フィルタの範囲
-    min_component_area : 連結成分の最小面積（ノイズ除去）
-    min_circle_area : 円検出の最小面積
-    min_circularity : 円形度の最小値
-    max_radius : 最大半径（px）。大きすぎるものを除外。
-
-    Returns
-    -------
-    検出されたスリーブのリスト
+    HSV連結成分 + HoughCircles の併用でスリーブ青丸を検出。
     """
     # ROI適用
     y_offset, x_offset = 0, 0
@@ -128,111 +206,47 @@ def detect_sleeves_with_annotations(
         y_offset = y_start
         x_offset = x_start
 
-    # 1. HSV青フィルタ
-    hsv = cv2.cvtColor(work_img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array(hsv_lower), np.array(hsv_upper))
+    # 方式A: HSV連結成分
+    circles_a = _detect_by_hsv_components(
+        work_img, hsv_lower, hsv_upper,
+        min_component_area, min_circle_area, min_circularity, max_radius,
+    )
+    # 方式B: HoughCircles + 青判定
+    circles_b = _detect_by_hough(
+        work_img, hsv_lower, hsv_upper,
+        min_radius=3, max_radius=int(max_radius),
+    )
 
-    # 2. 軽いCLOSE(3x3)でピクセル隙間を埋めるだけ（大きいカーネルだと複数スリーブが結合する）
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # マージ
+    all_circles = circles_a + circles_b
 
-    # 3. 連結成分分析
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
-
+    # SleeveDetectionに変換
     results: list[SleeveDetection] = []
+    for center, radius, circularity in all_circles:
+        center_global = PixelPoint(x=center.x + x_offset, y=center.y + y_offset)
 
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_component_area:
-            continue
-
-        component_mask = (labels == i).astype(np.uint8) * 255
-
-        sx = stats[i, cv2.CC_STAT_LEFT]
-        sy = stats[i, cv2.CC_STAT_TOP]
-        sw = stats[i, cv2.CC_STAT_WIDTH]
-        sh = stats[i, cv2.CC_STAT_HEIGHT]
-
-        # 4. 全輪郭から円形のものを探す（RETR_LIST で内側輪郭も取得）
-        contours, _ = cv2.findContours(
-            component_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        sleeve_circle = SleeveCircle(
+            center_px=center_global,
+            radius_px=radius,
+            circularity=circularity,
+            color_confidence=0.9,
         )
 
-        circles = _find_all_circular_contours(contours, min_circle_area, min_circularity)
+        r_int = max(1, int(radius))
+        comp_bbox = BBox(
+            x=center_global.x - r_int,
+            y=center_global.y - r_int,
+            w=r_int * 2,
+            h=r_int * 2,
+        )
 
-        if not circles:
-            # 輪郭全体で1つの円として判定
-            circle_info = _find_most_circular_contour(contours, min_circle_area)
-            if circle_info and circle_info[2] >= min_circularity:
-                circles = [circle_info]
-
-        for center, radius, circularity in circles:
-            if radius > max_radius:
-                continue
-
-            # オフセット適用（ROI座標 → 元画像座標）
-            center_global = PixelPoint(
-                x=center.x + x_offset,
-                y=center.y + y_offset,
+        results.append(
+            SleeveDetection(
+                circle=sleeve_circle,
+                text_bbox=None,  # テキスト紐付けはmain.pyの距離ベースに任せる
+                component_bbox=comp_bbox,
             )
+        )
 
-            sleeve_circle = SleeveCircle(
-                center_px=center_global,
-                radius_px=radius,
-                circularity=circularity,
-                color_confidence=0.9,
-            )
-
-            # BBox（元画像座標系）
-            comp_bbox = BBox(
-                x=sx + x_offset,
-                y=sy + y_offset,
-                w=sw,
-                h=sh,
-            )
-
-            text_bbox = _get_text_region_bbox(component_mask, center, radius)
-            if text_bbox:
-                text_bbox = BBox(
-                    x=text_bbox.x + x_offset,
-                    y=text_bbox.y + y_offset,
-                    w=text_bbox.w,
-                    h=text_bbox.h,
-                )
-
-            results.append(
-                SleeveDetection(
-                    circle=sleeve_circle,
-                    text_bbox=text_bbox,
-                    component_bbox=comp_bbox,
-                )
-            )
-
-    # 重複除去: 近い円は1つにまとめる
     results = _deduplicate(results, min_distance=10.0)
-
     return results
-
-
-def _deduplicate(detections: list[SleeveDetection], min_distance: float) -> list[SleeveDetection]:
-    """近接するスリーブ検出を統合。"""
-    if not detections:
-        return detections
-
-    # 信頼度（circularity）順にソート
-    detections.sort(key=lambda d: d.circle.circularity, reverse=True)
-
-    kept: list[SleeveDetection] = []
-    for det in detections:
-        is_dup = False
-        for k in kept:
-            dx = det.circle.center_px.x - k.circle.center_px.x
-            dy = det.circle.center_px.y - k.circle.center_px.y
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist < min_distance:
-                is_dup = True
-                break
-        if not is_dup:
-            kept.append(det)
-
-    return kept

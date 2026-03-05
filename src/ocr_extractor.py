@@ -87,7 +87,7 @@ def run_azure_ocr(
     texts: list[OcrText] = []
 
     if not result.pages:
-        return texts
+        return _postprocess_ocr(texts)
 
     page = result.pages[0]
     # ページサイズ（インチ）
@@ -128,4 +128,30 @@ def run_azure_ocr(
                 )
             )
 
-    return texts
+    return _postprocess_ocr(texts)
+
+
+# 図面特有のOCR誤読パターン
+_OCR_REPLACEMENTS = [
+    ("¢", "Φ"),       # Φ の誤読
+    ("##", "排水"),    # 排水 の誤読
+    ("#:", "排"),       # 排 の誤読
+]
+
+
+def _postprocess_ocr(texts: list[OcrText]) -> list[OcrText]:
+    """図面OCRでよくある誤読を補正。"""
+    result = []
+    for t in texts:
+        corrected = t.text
+        for old, new in _OCR_REPLACEMENTS:
+            corrected = corrected.replace(old, new)
+        result.append(
+            OcrText(
+                text=corrected,
+                position_px=t.position_px,
+                bbox=t.bbox,
+                confidence=t.confidence,
+            )
+        )
+    return result
