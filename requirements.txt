@@ -6,3 +6,4 @@ azure-ai-documentintelligence
 google-genai
 pdf2image
 Pillow
+streamlit

@@ -18,7 +18,18 @@ from models import BBox, PixelPoint, SleeveCircle
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TEMPLATE = PROJECT_ROOT / "docs" / "スリーブ例画像.png"
+TEMPLATE_DIR = PROJECT_ROOT / "docs"
+
+# テンプレートファイル一覧
+TEMPLATE_FILES = [
+    "template1.png",
+    "template2.png",
+    "template3.png",
+    "template4.png",
+    "template5.png",
+    "template6.png",
+    "スリーブ例画像.png",
+]
 
 
 @dataclass
@@ -41,10 +52,12 @@ def _nms_points(
     kept: list[tuple[PixelPoint, float, float]] = []
     for pt, score, radius in points:
         is_dup = False
-        for kpt, _, _ in kept:
+        for kpt, _, kr in kept:
             dx = pt.x - kpt.x
             dy = pt.y - kpt.y
-            if (dx * dx + dy * dy) ** 0.5 < min_dist:
+            # 半径ベースの動的距離
+            dynamic_dist = max(min_dist, max(radius, kr) * 1.5)
+            if (dx * dx + dy * dy) ** 0.5 < dynamic_dist:
                 is_dup = True
                 break
         if not is_dup:
@@ -52,40 +65,56 @@ def _nms_points(
     return kept
 
 
+def _load_templates(
+    hsv_lower: np.ndarray,
+    hsv_upper: np.ndarray,
+) -> list[tuple[str, np.ndarray]]:
+    """テンプレート画像を読み込み、青マスク化して返す。"""
+    templates = []
+    for fname in TEMPLATE_FILES:
+        path = TEMPLATE_DIR / fname
+        if not path.exists():
+            print(f"       [WARN] Template not found: {path}")
+            continue
+        bgr = cv2.imread(str(path))
+        if bgr is None:
+            print(f"       [WARN] Cannot read template: {path}")
+            continue
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, hsv_lower, hsv_upper)
+        templates.append((fname, mask))
+    return templates
+
+
 def detect_sleeves_with_annotations(
     img: np.ndarray,
     roi: Optional[tuple[int, int, int, int]] = None,
-    template_path: str | Path = DEFAULT_TEMPLATE,
     threshold: float = 0.8,
     scales: list[float] | None = None,
     min_dist: float = 10.0,
     **_kwargs,
 ) -> list[SleeveDetection]:
     """
-    テンプレートマッチングでスリーブ青丸を検出。
+    マルチテンプレートマッチングでスリーブ青丸を検出。
 
     Parameters
     ----------
     img : BGR画像
     roi : (y_start, y_end, x_start, x_end) 検出対象領域
-    template_path : スリーブテンプレート画像パス
     threshold : マッチング閾値（TM_CCOEFF_NORMED）
     scales : テンプレートのスケール倍率リスト
     min_dist : NMS最小距離(px)
     """
-    template_path = Path(template_path)
-    if not template_path.exists():
-        print(f"       [WARN] Sleeve template not found: {template_path}")
-        return []
-
     # HSV青フィルタ共通パラメータ
     hsv_lower = np.array([90, 50, 50])
     hsv_upper = np.array([135, 255, 255])
 
-    # テンプレート読み込み → 青マスク（二値化）
-    tmpl_bgr = cv2.imread(str(template_path))
-    tmpl_hsv = cv2.cvtColor(tmpl_bgr, cv2.COLOR_BGR2HSV)
-    tmpl_mask = cv2.inRange(tmpl_hsv, hsv_lower, hsv_upper)
+    # テンプレート読み込み
+    templates = _load_templates(hsv_lower, hsv_upper)
+    if not templates:
+        print("       [WARN] No templates loaded")
+        return []
+    print(f"       [INFO] Loaded {len(templates)} templates")
 
     # ROI適用
     y_offset, x_offset = 0, 0
@@ -102,30 +131,28 @@ def detect_sleeves_with_annotations(
     dh, dw = drawing_mask.shape[:2]
 
     if scales is None:
-        scales = [i / 100 for i in range(1, 400, 1)]  # 0.10, 0.12, ... 0.50
+        scales = [i / 100 for i in range(1, 400, 1)]
 
     all_detections: list[tuple[PixelPoint, float, float]] = []
 
-    for scale in scales:
-        # テンプレートをリサイズ
-        tw = max(3, int(tmpl_mask.shape[1] * scale))
-        th = max(3, int(tmpl_mask.shape[0] * scale))
-        resized = cv2.resize(tmpl_mask, (tw, th), interpolation=cv2.INTER_AREA)
+    for tmpl_name, tmpl_mask in templates:
+        for scale in scales:
+            tw = max(3, int(tmpl_mask.shape[1] * scale))
+            th = max(3, int(tmpl_mask.shape[0] * scale))
+            resized = cv2.resize(tmpl_mask, (tw, th), interpolation=cv2.INTER_AREA)
 
-        if tw < 8 or th < 8 or tw > dw or th > dh:
-            continue
+            if tw < 8 or th < 8 or tw > dw or th > dh:
+                continue
 
-        # 青マスク同士でテンプレートマッチング
-        result = cv2.matchTemplate(drawing_mask, resized, cv2.TM_CCOEFF_NORMED)
+            result = cv2.matchTemplate(drawing_mask, resized, cv2.TM_CCOEFF_NORMED)
 
-        # 閾値以上の場所を取得
-        locs = np.where(result >= threshold)
-        for py, px in zip(*locs):
-            score = float(result[py, px])
-            cx = px + tw / 2
-            cy = py + th / 2
-            radius = max(tw, th) / 2
-            all_detections.append((PixelPoint(x=cx, y=cy), score, radius))
+            locs = np.where(result >= threshold)
+            for py, px in zip(*locs):
+                score = float(result[py, px])
+                cx = px + tw / 2
+                cy = py + th / 2
+                radius = max(tw, th) / 2
+                all_detections.append((PixelPoint(x=cx, y=cy), score, radius))
 
     # NMSで重複除去
     all_detections = _nms_points(all_detections, min_dist=min_dist)
