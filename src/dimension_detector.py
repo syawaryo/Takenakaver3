@@ -21,6 +21,15 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEMPLATE = PROJECT_ROOT / "template" / "image.png"
 
+TEMPLATE_DIR = PROJECT_ROOT / "docs"
+CONNECT_TEMPLATE_FILES = [
+    "connecttemplate1.png",
+    "connecttemplate2.png",
+    "connecttemplate3.png",
+    "connecttemplate4.png",
+    "connecttemplate5.png",
+]
+
 
 def _match_nearby_text(
     point: PixelPoint,
@@ -67,6 +76,22 @@ def _nms_points(points: list[tuple[PixelPoint, float]], min_dist: float = 15.0) 
     return kept
 
 
+def _load_connect_templates() -> list[tuple[str, np.ndarray]]:
+    """接続点テンプレートをカラーで読み込む。"""
+    templates = []
+    for fname in CONNECT_TEMPLATE_FILES:
+        path = TEMPLATE_DIR / fname
+        if not path.exists():
+            print(f"       [WARN] Connect template not found: {path}")
+            continue
+        bgr = cv2.imread(str(path))
+        if bgr is None:
+            print(f"       [WARN] Cannot read connect template: {path}")
+            continue
+        templates.append((fname, bgr))
+    return templates
+
+
 def detect_dimension_points(
     drawing_image_bytes: bytes,
     ocr_texts: list[OcrText] | None = None,
@@ -76,63 +101,64 @@ def detect_dimension_points(
     scales: list[float] | None = None,
 ) -> list[DimensionPoint]:
     """
-    OpenCV テンプレートマッチングで寸法線接続点の丸印を検出。
+    OpenCV マルチテンプレートマッチング（カラー）で寸法線接続点の丸印を検出。
 
     Parameters
     ----------
     drawing_image_bytes : 図面画像のバイト列
     ocr_texts : OCRテキスト（近傍寸法値の紐付け用）
     original_size : 未使用（互換性のため残す）
-    template_path : テンプレート画像パス
+    template_path : 旧テンプレート画像パス（フォールバック用）
     threshold : マッチング閾値（0-1、高いほど厳密）
     scales : テンプレートのスケール倍率リスト
     """
-    template_path = Path(template_path)
-    if not template_path.exists():
-        print(f"[WARN] Template not found: {template_path}, skipping")
-        return []
-
-    # テンプレート読み込み
-    tmpl_color = cv2.imread(str(template_path))
-    if tmpl_color is None:
-        print(f"[WARN] Cannot read template: {template_path}")
-        return []
-    tmpl_gray = cv2.cvtColor(tmpl_color, cv2.COLOR_BGR2GRAY)
-
-    # 図面画像を復元
+    # 図面画像を復元（カラー）
     arr = np.frombuffer(drawing_image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         print("[WARN] Cannot decode drawing image")
         return []
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # テンプレート読み込み（connecttemplate1~5 + 旧テンプレート）
+    templates = _load_connect_templates()
+
+    # 旧テンプレートもフォールバックとして追加
+    old_path = Path(template_path)
+    if old_path.exists():
+        old_tmpl = cv2.imread(str(old_path))
+        if old_tmpl is not None:
+            templates.append(("legacy_template", old_tmpl))
+
+    if not templates:
+        print("       [WARN] No connect templates loaded")
+        return []
+    print(f"       [INFO] Loaded {len(templates)} connect templates")
 
     if scales is None:
         scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4]
 
     all_detections: list[tuple[PixelPoint, float]] = []
 
-    for scale in scales:
-        # テンプレートをリサイズ
-        th, tw = tmpl_gray.shape[:2]
-        new_w = max(3, int(tw * scale))
-        new_h = max(3, int(th * scale))
-        scaled_tmpl = cv2.resize(tmpl_gray, (new_w, new_h))
+    for tmpl_name, tmpl_color in templates:
+        th, tw = tmpl_color.shape[:2]
 
-        # 図面が小さすぎたらスキップ
-        if new_w > img_gray.shape[1] or new_h > img_gray.shape[0]:
-            continue
+        for scale in scales:
+            new_w = max(3, int(tw * scale))
+            new_h = max(3, int(th * scale))
+            scaled_tmpl = cv2.resize(tmpl_color, (new_w, new_h))
 
-        # テンプレートマッチング
-        result = cv2.matchTemplate(img_gray, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+            if new_w > img.shape[1] or new_h > img.shape[0]:
+                continue
 
-        # 閾値以上の位置を取得
-        locs = np.where(result >= threshold)
-        for py, px in zip(*locs):
-            cx = px + new_w / 2
-            cy = py + new_h / 2
-            score = float(result[py, px])
-            all_detections.append((PixelPoint(x=cx, y=cy), score))
+            # カラーでテンプレートマッチング
+            result = cv2.matchTemplate(img, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+
+            locs = np.where(result >= threshold)
+            for py, px in zip(*locs):
+                cx = px + new_w / 2
+                cy = py + new_h / 2
+                score = float(result[py, px])
+                all_detections.append((PixelPoint(x=cx, y=cy), score))
 
     # NMSで重複除去
     all_detections = _nms_points(all_detections, min_dist=8.0)
