@@ -77,10 +77,10 @@ if uploaded is not None:
                 col1, col2 = st.columns(2)
                 with col1:
                     st.subheader("元画像")
-                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width="stretch")
                 with col2:
                     st.subheader("検出結果オーバーレイ")
-                    st.image(overlay_rgb, use_container_width=True)
+                    st.image(overlay_rgb, width="stretch")
 
                 # サマリー
                 st.divider()
@@ -109,7 +109,7 @@ if uploaded is not None:
                             "Y (px)": f"{s.circle.center_px.y:.0f}",
                             "信頼度": f"{s.confidence:.2f}",
                         })
-                    st.dataframe(rows, use_container_width=True)
+                    st.dataframe(rows, width="stretch")
 
                 # JSON ダウンロード
                 st.subheader("結果JSON")
