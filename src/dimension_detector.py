@@ -174,7 +174,7 @@ def detect_dimension_points(
                 all_detections.append((PixelPoint(x=cx, y=cy), score))
 
     # NMSで重複除去
-    all_detections = _nms_points(all_detections, min_dist=8.0)
+    all_detections = _nms_points(all_detections, min_dist=5.0)
     print(f"       [INFO] Template matches after NMS: {len(all_detections)}")
 
     # デバッグ画像保存

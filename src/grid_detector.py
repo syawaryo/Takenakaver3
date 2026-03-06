@@ -17,13 +17,20 @@ from models import GridLine, OcrText, PixelPoint
 def _detect_lines_morphology(
     gray: np.ndarray,
     direction: str,
-    kernel_ratio: float = 1 / 3,
+    kernel_ratio: float = 8 / 9,
 ) -> np.ndarray:
     """モルフォロジーOPENで縦線 or 横線のみを抽出。"""
     h, w = gray.shape[:2]
 
     # 二値化（OTSU）
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 先にCLOSEで小さなギャップ（テキストやスリーブによる分断）を埋める
+    if direction == "vertical":
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    else:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
 
     if direction == "vertical":
         ksize = max(1, int(h * kernel_ratio))
@@ -127,7 +134,7 @@ def detect_grid_lines(
     gray: np.ndarray,
     ocr_texts: list[OcrText] | None = None,
     roi: tuple[int, int, int, int] | None = None,
-    kernel_ratio: float = 1 / 3,
+    kernel_ratio: float = 8 / 9,
     min_peak_distance: int = 30,
 ) -> list[GridLine]:
     """
@@ -159,34 +166,42 @@ def detect_grid_lines(
     results: list[GridLine] = []
 
     for direction in ("vertical", "horizontal"):
-        line_img = _detect_lines_morphology(work_gray, direction, kernel_ratio)
+        # 2段階検出: 厳しい閾値 → 端の通り芯用に緩い閾値で補完
+        found_positions: set[int] = set()
 
-        # 射影ヒストグラム
-        if direction == "vertical":
-            projection = np.sum(line_img, axis=0) / 255
-        else:
-            projection = np.sum(line_img, axis=1) / 255
+        for ratio in [kernel_ratio, kernel_ratio * 0.5]:
+            line_img = _detect_lines_morphology(work_gray, direction, ratio)
 
-        peaks = _find_peaks(projection, min_peak_distance)
+            if direction == "vertical":
+                projection = np.sum(line_img, axis=0) / 255
+            else:
+                projection = np.sum(line_img, axis=1) / 255
 
-        for pos in peaks:
-            # ROI座標 → 元画像座標
-            global_pos = float(pos + (x_off if direction == "vertical" else y_off))
+            peaks = _find_peaks(projection, min_peak_distance)
 
-            label = None
-            if ocr_texts:
-                label = _match_label_to_position(
-                    global_pos, direction, ocr_texts, (h, w)
+            for pos in peaks:
+                # 既に検出済みの近傍はスキップ
+                if any(abs(pos - fp) < min_peak_distance for fp in found_positions):
+                    continue
+                found_positions.add(pos)
+
+                global_pos = float(pos + (x_off if direction == "vertical" else y_off))
+
+                label = None
+                if ocr_texts:
+                    label = _match_label_to_position(
+                        global_pos, direction, ocr_texts, (h, w)
+                    )
+
+                confidence = 0.8 if ratio == kernel_ratio else 0.6
+                results.append(
+                    GridLine(
+                        label=label or f"{'V' if direction == 'vertical' else 'H'}-{int(global_pos)}",
+                        direction=direction,
+                        position_px=global_pos,
+                        confidence=confidence,
+                    )
                 )
-
-            results.append(
-                GridLine(
-                    label=label or f"{'V' if direction == 'vertical' else 'H'}-{int(global_pos)}",
-                    direction=direction,
-                    position_px=global_pos,
-                    confidence=0.8,
-                )
-            )
 
     return results
 

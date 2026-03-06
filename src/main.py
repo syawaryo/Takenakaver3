@@ -198,20 +198,17 @@ def draw_overlay(img: np.ndarray, result: FloorSleeveDrawingAnalysis) -> np.ndar
         cv2.drawMarker(overlay, (cx, cy), (0, 0, 255),
                        cv2.MARKER_CROSS, 6, 1)
 
-        # テキスト
-        label = s.parsed.sleeve_no or s.raw_text[:15] or s.detection_id
+        # テキスト（SK番号のみ）
+        label = s.parsed.sleeve_no or s.detection_id
         cv2.putText(overlay, label, (cx + r + 3, cy - 3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
 
-    # 寸法接続点: 黄色マーカー
+    # 寸法接続点: 黄色マーカー（数値テキストは非表示）
     for dp in result.dimension_points:
         px = int(dp.position_px.x)
         py = int(dp.position_px.y)
         cv2.drawMarker(overlay, (px, py), (0, 255, 255),
                        cv2.MARKER_DIAMOND, 8, 2)
-        if dp.nearby_text:
-            cv2.putText(overlay, dp.nearby_text, (px + 5, py - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
 
     return overlay
 
@@ -239,6 +236,25 @@ def draw_reconstruction_map(
             cv2.line(canvas, (0, y), (w, y), grid_color, 1)
             cv2.putText(canvas, g.label, (5, y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 1)
+
+    # --- 通り芯付近の寸法値を表示 ---
+    import re as _re_grid
+    dim_value_color = (60, 60, 200)
+    margin_px = 20  # 通り芯からの検索範囲(px)
+
+    for g in result.grid_lines:
+        pos = g.position_px
+        for t in result.all_texts:
+            cleaned = t.text.strip().replace(",", "").replace(".", "")
+            if not _re_grid.match(r"^\d{3,4}$", cleaned):
+                continue
+            tx, ty = t.position_px.x, t.position_px.y
+            if g.direction == "vertical" and abs(tx - pos) < margin_px:
+                cv2.putText(canvas, t.text.strip(), (int(tx), int(ty)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, dim_value_color, 1)
+            elif g.direction == "horizontal" and abs(ty - pos) < margin_px:
+                cv2.putText(canvas, t.text.strip(), (int(tx), int(ty)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, dim_value_color, 1)
 
     # --- スリーブ（青丸 + SK番号 + スペック）---
     sleeve_color = (200, 80, 0)  # 青系
@@ -275,36 +291,13 @@ def draw_reconstruction_map(
 
         sleeve_positions.append((cx, cy, label))
 
-    # --- 接続点（黄色ダイヤ + 寸法値）---
+    # --- 接続点（黄色マーカーのみ）---
     dim_color = (0, 180, 180)
     for dp in result.dimension_points:
         px = int(dp.position_px.x)
         py = int(dp.position_px.y)
         cv2.drawMarker(canvas, (px, py), dim_color, cv2.MARKER_DIAMOND, 10, 2)
-        if dp.nearby_text:
-            cv2.putText(canvas, dp.nearby_text, (px + 6, py - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, dim_color, 1)
 
-    # --- 通り芯付近の数値OCRテキストを元の位置に配置 ---
-    import re as _re
-    dim_text_color = (80, 80, 200)
-    margin = 50  # 通り芯からの許容距離(px)
-
-    v_positions = [int(g.position_px) for g in result.grid_lines if g.direction == "vertical"]
-    h_positions = [int(g.position_px) for g in result.grid_lines if g.direction == "horizontal"]
-
-    for t in result.all_texts:
-        cleaned = t.text.strip().replace(",", "")
-        if not _re.match(r"^\d{2,6}$", cleaned):
-            continue
-        tx = int(t.position_px.x)
-        ty = int(t.position_px.y)
-        # 垂直通り芯のx座標付近 or 水平通り芯のy座標付近にあれば表示
-        near_v = any(abs(tx - vx) < margin for vx in v_positions)
-        near_h = any(abs(ty - hy) < margin for hy in h_positions)
-        if near_v or near_h:
-            cv2.putText(canvas, t.text, (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, dim_text_color, 1)
 
     return canvas
 
@@ -320,7 +313,7 @@ def analyze(
     output_dir: str = "output",
 ) -> FloorSleeveDrawingAnalysis:
     """図面解析パイプライン。"""
-    print(f"[1/6] Loading image: {path}")
+    print(f"[1/5] Loading image: {path}")
     img = load_image(path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
@@ -328,12 +321,8 @@ def analyze(
 
     print(f"       Image size: {w} x {h}")
 
-    # --- ROI検出（ツールバー除外）---
-    roi = detect_drawing_roi(img)
-    print(f"       Drawing ROI: y={roi[0]}-{roi[1]}, x={roi[2]}-{roi[3]}")
-
     # --- OCR ---
-    print("[2/6] Running Azure DI OCR...")
+    print("[2/5] Running Azure DI OCR...")
     try:
         from ocr_extractor import run_azure_ocr
         ocr_texts = run_azure_ocr(img_bytes, w, h)
@@ -343,19 +332,19 @@ def analyze(
         ocr_texts = []
 
     # --- 通り芯検出 ---
-    print("[3/6] Detecting grid lines...")
-    grid_lines = detect_grid_lines(gray, ocr_texts, roi=roi)
+    print("[3/5] Detecting grid lines...")
+    grid_lines = detect_grid_lines(gray, ocr_texts)
     print(f"       Found {len(grid_lines)} grid lines")
 
     # --- スリーブ検出 ---
-    print("[4/6] Detecting sleeves (blue component analysis)...")
-    sleeve_detections = detect_sleeves_with_annotations(img, roi=roi)
+    print("[4/5] Detecting sleeves (template matching)...")
+    sleeve_detections = detect_sleeves_with_annotations(img)
     print(f"       Found {len(sleeve_detections)} sleeve candidates")
 
     # --- 寸法接続点検出 ---
     dim_points = []
     if use_nanobanana:
-        print("[5/6] Detecting dimension connection points...")
+        print("[5/5] Detecting dimension connection points...")
         try:
             from dimension_detector import detect_dimension_points
             dim_points = detect_dimension_points(img_bytes, ocr_texts, original_size=(w, h))
