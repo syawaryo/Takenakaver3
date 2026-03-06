@@ -216,6 +216,99 @@ def draw_overlay(img: np.ndarray, result: FloorSleeveDrawingAnalysis) -> np.ndar
     return overlay
 
 
+def draw_reconstruction_map(
+    w: int, h: int, result: FloorSleeveDrawingAnalysis,
+) -> np.ndarray:
+    """
+    白背景に検出結果だけで図面を再構成する。
+    通り芯 + スリーブ + 接続点 + スリーブ間距離を1枚にまとめる。
+    """
+    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
+
+    # --- 通り芯（薄いグレー線 + ラベル）---
+    grid_color = (180, 180, 180)
+    label_color = (100, 100, 100)
+    for g in result.grid_lines:
+        if g.direction == "vertical":
+            x = int(g.position_px)
+            cv2.line(canvas, (x, 0), (x, h), grid_color, 1)
+            cv2.putText(canvas, g.label, (x + 3, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 1)
+        else:
+            y = int(g.position_px)
+            cv2.line(canvas, (0, y), (w, y), grid_color, 1)
+            cv2.putText(canvas, g.label, (5, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 1)
+
+    # --- スリーブ（青丸 + SK番号 + スペック）---
+    sleeve_color = (200, 80, 0)  # 青系
+    sleeve_positions: list[tuple[int, int, str]] = []
+    for s in result.sleeves:
+        cx = int(s.circle.center_px.x)
+        cy = int(s.circle.center_px.y)
+        r = max(5, int(s.circle.radius_px))
+
+        cv2.circle(canvas, (cx, cy), r, sleeve_color, 2)
+        cv2.drawMarker(canvas, (cx, cy), sleeve_color, cv2.MARKER_CROSS, 8, 1)
+
+        label = s.parsed.sleeve_no or s.detection_id
+        cv2.putText(canvas, label, (cx + r + 4, cy - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, sleeve_color, 1)
+
+        # 用途
+        if s.parsed.purpose:
+            cv2.putText(canvas, s.parsed.purpose, (cx + r + 4, cy + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
+
+        # スペック情報（呼び径 + 口径 + 区分）
+        spec_parts = []
+        if s.parsed.nominal_size:
+            spec_parts.append(s.parsed.nominal_size)
+        if s.parsed.bore_diameter:
+            spec_parts.append(s.parsed.bore_diameter)
+        if s.parsed.category:
+            spec_parts.append(s.parsed.category)
+        if spec_parts:
+            spec_text = " ".join(spec_parts)
+            cv2.putText(canvas, spec_text, (cx + r + 4, cy + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (120, 120, 120), 1)
+
+        sleeve_positions.append((cx, cy, label))
+
+    # --- 接続点（黄色ダイヤ + 寸法値）---
+    dim_color = (0, 180, 180)
+    for dp in result.dimension_points:
+        px = int(dp.position_px.x)
+        py = int(dp.position_px.y)
+        cv2.drawMarker(canvas, (px, py), dim_color, cv2.MARKER_DIAMOND, 10, 2)
+        if dp.nearby_text:
+            cv2.putText(canvas, dp.nearby_text, (px + 6, py - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, dim_color, 1)
+
+    # --- 通り芯付近の数値OCRテキストを元の位置に配置 ---
+    import re as _re
+    dim_text_color = (80, 80, 200)
+    margin = 50  # 通り芯からの許容距離(px)
+
+    v_positions = [int(g.position_px) for g in result.grid_lines if g.direction == "vertical"]
+    h_positions = [int(g.position_px) for g in result.grid_lines if g.direction == "horizontal"]
+
+    for t in result.all_texts:
+        cleaned = t.text.strip().replace(",", "")
+        if not _re.match(r"^\d{2,6}$", cleaned):
+            continue
+        tx = int(t.position_px.x)
+        ty = int(t.position_px.y)
+        # 垂直通り芯のx座標付近 or 水平通り芯のy座標付近にあれば表示
+        near_v = any(abs(tx - vx) < margin for vx in v_positions)
+        near_h = any(abs(ty - hy) < margin for hy in h_positions)
+        if near_v or near_h:
+            cv2.putText(canvas, t.text, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, dim_text_color, 1)
+
+    return canvas
+
+
 # ==========================================================================
 # メインパイプライン
 # ==========================================================================
@@ -262,11 +355,28 @@ def analyze(
     # --- 寸法接続点検出 ---
     dim_points = []
     if use_nanobanana:
-        print("[5/6] Detecting dimension connection points (Gemini)...")
+        print("[5/6] Detecting dimension connection points...")
         try:
             from dimension_detector import detect_dimension_points
             dim_points = detect_dimension_points(img_bytes, ocr_texts, original_size=(w, h))
-            print(f"       Found {len(dim_points)} dimension points")
+            print(f"       Found {len(dim_points)} dimension points (before filtering)")
+
+            # スリーブ位置と重複する接続点を除外
+            filtered = []
+            for dp in dim_points:
+                too_close = False
+                for det in sleeve_detections:
+                    sx = det.circle.center_px.x
+                    sy = det.circle.center_px.y
+                    sr = det.circle.radius_px
+                    dist = ((dp.position_px.x - sx) ** 2 + (dp.position_px.y - sy) ** 2) ** 0.5
+                    if dist < sr:
+                        too_close = True
+                        break
+                if not too_close:
+                    filtered.append(dp)
+            print(f"       After sleeve overlap filter: {len(filtered)} dimension points")
+            dim_points = filtered
         except Exception as e:
             print(f"       [WARN] Dimension detection failed: {e}")
     else:
@@ -421,6 +531,12 @@ def analyze(
     overlay_path = out_dir / "overlay.png"
     cv2.imwrite(str(overlay_path), overlay)
     print(f"[OUTPUT] {overlay_path}")
+
+    # 再構成マップ出力（白背景に検出結果だけで図面を再現）
+    recon_map = draw_reconstruction_map(w, h, result)
+    recon_path = out_dir / "reconstruction_map.png"
+    cv2.imwrite(str(recon_path), recon_map)
+    print(f"[OUTPUT] {recon_path}")
 
     # サマリー
     print(f"\n=== Summary ===")

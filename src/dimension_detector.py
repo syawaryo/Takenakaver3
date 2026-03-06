@@ -76,8 +76,17 @@ def _nms_points(points: list[tuple[PixelPoint, float]], min_dist: float = 15.0) 
     return kept
 
 
+def _remove_blue(img_bgr: np.ndarray) -> np.ndarray:
+    """画像から青い領域を白に置換（カラーのまま返す）。"""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    blue_mask = cv2.inRange(hsv, np.array([90, 50, 50]), np.array([135, 255, 255]))
+    img_no_blue = img_bgr.copy()
+    img_no_blue[blue_mask > 0] = [255, 255, 255]
+    return img_no_blue
+
+
 def _load_connect_templates() -> list[tuple[str, np.ndarray]]:
-    """接続点テンプレートをカラーで読み込む。"""
+    """接続点テンプレートを読み込み、青除去（カラー）して返す。"""
     templates = []
     for fname in CONNECT_TEMPLATE_FILES:
         path = TEMPLATE_DIR / fname
@@ -88,7 +97,8 @@ def _load_connect_templates() -> list[tuple[str, np.ndarray]]:
         if bgr is None:
             print(f"       [WARN] Cannot read connect template: {path}")
             continue
-        templates.append((fname, bgr))
+        no_blue = _remove_blue(bgr)
+        templates.append((fname, no_blue))
     return templates
 
 
@@ -119,6 +129,9 @@ def detect_dimension_points(
         print("[WARN] Cannot decode drawing image")
         return []
 
+    # 図面画像も青除去（カラーのまま）
+    img_no_blue = _remove_blue(img)
+
     # テンプレート読み込み（connecttemplate1~5 + 旧テンプレート）
     templates = _load_connect_templates()
 
@@ -127,7 +140,7 @@ def detect_dimension_points(
     if old_path.exists():
         old_tmpl = cv2.imread(str(old_path))
         if old_tmpl is not None:
-            templates.append(("legacy_template", old_tmpl))
+            templates.append(("legacy_template", _remove_blue(old_tmpl)))
 
     if not templates:
         print("       [WARN] No connect templates loaded")
@@ -147,11 +160,11 @@ def detect_dimension_points(
             new_h = max(3, int(th * scale))
             scaled_tmpl = cv2.resize(tmpl_color, (new_w, new_h))
 
-            if new_w > img.shape[1] or new_h > img.shape[0]:
+            if new_w > img_no_blue.shape[1] or new_h > img_no_blue.shape[0]:
                 continue
 
-            # カラーでテンプレートマッチング
-            result = cv2.matchTemplate(img, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+            # カラー（青除去済み）でテンプレートマッチング
+            result = cv2.matchTemplate(img_no_blue, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
 
             locs = np.where(result >= threshold)
             for py, px in zip(*locs):
