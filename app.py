@@ -45,7 +45,7 @@ if uploaded is not None:
             import io
             import contextlib
 
-            from main import analyze, load_image, draw_overlay
+            from main import analyze, load_image, draw_overlay, draw_reconstruction_map
 
             # 一時出力ディレクトリ
             with tempfile.TemporaryDirectory() as out_dir:
@@ -74,13 +74,18 @@ if uploaded is not None:
                 overlay = draw_overlay(img, result)
                 overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.subheader("元画像")
                     st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width="stretch")
                 with col2:
                     st.subheader("検出結果オーバーレイ")
                     st.image(overlay_rgb, width="stretch")
+                with col3:
+                    st.subheader("再構成マップ")
+                    h_img, w_img = img.shape[:2]
+                    recon = draw_reconstruction_map(w_img, h_img, result)
+                    st.image(cv2.cvtColor(recon, cv2.COLOR_BGR2RGB), width="stretch")
 
                 # サマリー
                 st.divider()
