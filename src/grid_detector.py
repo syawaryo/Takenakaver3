@@ -169,7 +169,7 @@ def detect_grid_lines(
         # 2段階検出: 厳しい閾値 → 端の通り芯用に緩い閾値で補完
         found_positions: set[int] = set()
 
-        for ratio in [kernel_ratio, kernel_ratio * 0.5]:
+        for ratio in [kernel_ratio, kernel_ratio * 0.75]:
             line_img = _detect_lines_morphology(work_gray, direction, ratio)
 
             if direction == "vertical":
