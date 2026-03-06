@@ -318,40 +318,57 @@ def analyze(
     grid_lines = detect_grid_lines(gray, ocr_texts)
     print(f"       Found {len(grid_lines)} grid lines")
 
-    # --- スリーブ検出 ---
-    print("[4/5] Detecting sleeves (template matching)...")
-    sleeve_detections = detect_sleeves_with_annotations(img)
-    print(f"       Found {len(sleeve_detections)} sleeve candidates")
+    # --- スリーブ検出 + 寸法接続点検出（並列実行）---
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # --- 寸法接続点検出 ---
-    dim_points = []
-    if use_nanobanana:
+    def _run_sleeve_detection():
+        print("[4/5] Detecting sleeves (template matching)...")
+        dets = detect_sleeves_with_annotations(img)
+        print(f"       Found {len(dets)} sleeve candidates")
+        return dets
+
+    def _run_dimension_detection():
         print("[5/5] Detecting dimension connection points...")
-        try:
-            from dimension_detector import detect_dimension_points
-            dim_points = detect_dimension_points(img_bytes, ocr_texts, original_size=(w, h))
-            print(f"       Found {len(dim_points)} dimension points (before filtering)")
+        from dimension_detector import detect_dimension_points
+        pts = detect_dimension_points(img_bytes, ocr_texts, original_size=(w, h))
+        print(f"       Found {len(pts)} dimension points (before filtering)")
+        return pts
 
-            # スリーブ位置と重複する接続点を除外
-            filtered = []
-            for dp in dim_points:
-                too_close = False
-                for det in sleeve_detections:
-                    sx = det.circle.center_px.x
-                    sy = det.circle.center_px.y
-                    sr = det.circle.radius_px
-                    dist = ((dp.position_px.x - sx) ** 2 + (dp.position_px.y - sy) ** 2) ** 0.5
-                    if dist < sr:
-                        too_close = True
-                        break
-                if not too_close:
-                    filtered.append(dp)
-            print(f"       After sleeve overlap filter: {len(filtered)} dimension points")
-            dim_points = filtered
-        except Exception as e:
-            print(f"       [WARN] Dimension detection failed: {e}")
+    sleeve_detections = []
+    dim_points = []
+
+    if use_nanobanana:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            fut_sleeve = executor.submit(_run_sleeve_detection)
+            fut_dim = executor.submit(_run_dimension_detection)
+            try:
+                sleeve_detections = fut_sleeve.result()
+            except Exception as e:
+                print(f"       [WARN] Sleeve detection failed: {e}")
+            try:
+                dim_points = fut_dim.result()
+            except Exception as e:
+                print(f"       [WARN] Dimension detection failed: {e}")
+
+        # スリーブ位置と重複する接続点を除外
+        filtered = []
+        for dp in dim_points:
+            too_close = False
+            for det in sleeve_detections:
+                sx = det.circle.center_px.x
+                sy = det.circle.center_px.y
+                sr = det.circle.radius_px
+                dist = ((dp.position_px.x - sx) ** 2 + (dp.position_px.y - sy) ** 2) ** 0.5
+                if dist < sr:
+                    too_close = True
+                    break
+            if not too_close:
+                filtered.append(dp)
+        print(f"       After sleeve overlap filter: {len(filtered)} dimension points")
+        dim_points = filtered
     else:
-        print("[5/6] Skipping dimension detection (--no-nanobanana)")
+        sleeve_detections = _run_sleeve_detection()
+        print("[5/5] Skipping dimension detection (--no-nanobanana)")
 
     # --- テキスト紐付け + スリーブ構築 ---
     print("[6/6] Matching text to sleeves...")
@@ -384,7 +401,45 @@ def analyze(
             sleeve_sk_assignment[det_idx] = best
             claimed_sk.add(best[0])
 
-    # Step 2: 各スリーブのSK-xxx テキスト周辺の追加テキストを収集
+    # Step 2: SKテキストから同一行のテキストをまとめて取得
+    # 同じy座標 + x座標が連続しているテキストを1行として収集
+    line_y_tolerance = 15   # 同一行とみなすy座標の許容差(px)
+    line_x_gap_max = 150    # x方向の最大ギャップ(px) — これ以上離れていたら別行とみなす
+
+    def _collect_line_texts(anchor_ti: int, anchor_text: OcrText) -> tuple[list[OcrText], set[int]]:
+        """SKテキストと同一行のテキストをx連続性を考慮して収集。"""
+        anchor_y = anchor_text.position_px.y
+        # 同じy座標のテキスト候補を集める
+        candidates: list[tuple[float, int, OcrText]] = [(anchor_text.position_px.x, anchor_ti, anchor_text)]
+        for tj, t2 in enumerate(ocr_texts):
+            if tj == anchor_ti:
+                continue
+            if abs(t2.position_px.y - anchor_y) < line_y_tolerance:
+                candidates.append((t2.position_px.x, tj, t2))
+        # x座標順にソート
+        candidates.sort(key=lambda c: c[0])
+
+        # x連続性チェック: アンカーから左右に連続しているもののみ採用
+        anchor_pos = next(i for i, c in enumerate(candidates) if c[1] == anchor_ti)
+        line: list[tuple[float, int, OcrText]] = [candidates[anchor_pos]]
+        # 右方向
+        for i in range(anchor_pos + 1, len(candidates)):
+            if candidates[i][0] - candidates[i - 1][0] < line_x_gap_max:
+                line.append(candidates[i])
+            else:
+                break
+        # 左方向
+        for i in range(anchor_pos - 1, -1, -1):
+            if candidates[i + 1][0] - candidates[i][0] < line_x_gap_max:
+                line.insert(0, candidates[i])
+            else:
+                break
+
+        line.sort(key=lambda c: c[0])
+        texts = [t for _, _, t in line]
+        indices = {idx for _, idx, _ in line}
+        return texts, indices
+
     claimed_texts: set[int] = set(claimed_sk)
     sleeves: list[Sleeve] = []
     sleeve_raw_texts: list[str] = []
@@ -392,29 +447,26 @@ def analyze(
     for idx, det in enumerate(sleeve_detections):
         cx, cy = det.circle.center_px.x, det.circle.center_px.y
 
-        # SK-xxxテキストがあればそこを中心に、なければ円中心から検索
-        if idx in sleeve_sk_assignment:
-            sk_ti, sk_text = sleeve_sk_assignment[idx]
-            anchor_x, anchor_y = sk_text.position_px.x, sk_text.position_px.y
-        else:
-            anchor_x, anchor_y = cx, cy
-
-        # アンカー周辺のOCRテキストを距離順で収集
-        nearby: list[tuple[float, int, OcrText]] = []
-        for ti, t in enumerate(ocr_texts):
-            if ti in claimed_texts:
-                continue
-            dist = ((anchor_x - t.position_px.x) ** 2 + (anchor_y - t.position_px.y) ** 2) ** 0.5
-            if dist < 120.0:  # SK-xxxの近傍120px以内
-                nearby.append((dist, ti, t))
-        nearby.sort(key=lambda x: x[0])
-
         matched_texts: list[OcrText] = []
         if idx in sleeve_sk_assignment:
-            matched_texts.append(sleeve_sk_assignment[idx][1])
-        for dist, ti, t in nearby[:8]:
-            matched_texts.append(t)
-            claimed_texts.add(ti)
+            sk_ti, sk_text = sleeve_sk_assignment[idx]
+            # SK行を丸ごと取得
+            line_texts, line_indices = _collect_line_texts(sk_ti, sk_text)
+            matched_texts = line_texts
+            claimed_texts.update(line_indices)
+        else:
+            # SKテキストなし → 円の近傍テキストをフォールバック収集
+            nearby: list[tuple[float, int, OcrText]] = []
+            for ti, t in enumerate(ocr_texts):
+                if ti in claimed_texts:
+                    continue
+                dist = ((cx - t.position_px.x) ** 2 + (cy - t.position_px.y) ** 2) ** 0.5
+                if dist < 120.0:
+                    nearby.append((dist, ti, t))
+            nearby.sort(key=lambda c: c[0])
+            for dist, ti, t in nearby[:8]:
+                matched_texts.append(t)
+                claimed_texts.add(ti)
 
         text_center = None
         if matched_texts:

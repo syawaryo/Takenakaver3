@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -135,7 +136,17 @@ def detect_sleeves_with_annotations(
 
     all_detections: list[tuple[PixelPoint, float, float]] = []
 
-    for tmpl_name, tmpl_mask in templates:
+    def _match_single_template(
+        tmpl_name: str,
+        tmpl_mask: np.ndarray,
+        drawing_mask: np.ndarray,
+        scales: list[float],
+        threshold: float,
+        dw: int,
+        dh: int,
+    ) -> list[tuple[PixelPoint, float, float]]:
+        """1テンプレート分のマルチスケールマッチング。"""
+        hits: list[tuple[PixelPoint, float, float]] = []
         for scale in scales:
             tw = max(3, int(tmpl_mask.shape[1] * scale))
             th = max(3, int(tmpl_mask.shape[0] * scale))
@@ -152,7 +163,23 @@ def detect_sleeves_with_annotations(
                 cx = px + tw / 2
                 cy = py + th / 2
                 radius = max(tw, th) / 2
-                all_detections.append((PixelPoint(x=cx, y=cy), score, radius))
+                hits.append((PixelPoint(x=cx, y=cy), score, radius))
+        return hits
+
+    # テンプレートごとに並列実行
+    with ThreadPoolExecutor(max_workers=len(templates)) as executor:
+        futures = {
+            executor.submit(
+                _match_single_template,
+                tmpl_name, tmpl_mask, drawing_mask, scales, threshold, dw, dh,
+            ): tmpl_name
+            for tmpl_name, tmpl_mask in templates
+        }
+        for future in as_completed(futures):
+            tmpl_name = futures[future]
+            hits = future.result()
+            print(f"       [INFO] {tmpl_name}: {len(hits)} raw hits")
+            all_detections.extend(hits)
 
     # NMSで重複除去
     all_detections = _nms_points(all_detections, min_dist=min_dist)
