@@ -271,24 +271,6 @@ def draw_reconstruction_map(
         cv2.putText(canvas, label, (cx + r + 4, cy - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, sleeve_color, 1)
 
-        # 用途
-        if s.parsed.purpose:
-            cv2.putText(canvas, s.parsed.purpose, (cx + r + 4, cy + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
-
-        # スペック情報（呼び径 + 口径 + 区分）
-        spec_parts = []
-        if s.parsed.nominal_size:
-            spec_parts.append(s.parsed.nominal_size)
-        if s.parsed.bore_diameter:
-            spec_parts.append(s.parsed.bore_diameter)
-        if s.parsed.category:
-            spec_parts.append(s.parsed.category)
-        if spec_parts:
-            spec_text = " ".join(spec_parts)
-            cv2.putText(canvas, spec_text, (cx + r + 4, cy + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (120, 120, 120), 1)
-
         sleeve_positions.append((cx, cy, label))
 
     # --- 接続点（黄色マーカーのみ）---
