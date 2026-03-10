@@ -32,12 +32,32 @@ _SLEEVE_HINT = re.compile(
 )
 
 
-def _make_blue_mask(img_bgr: np.ndarray) -> np.ndarray:
-    """青色マスクを生成"""
+def _make_blue_mask(
+    img_bgr: np.ndarray,
+    paragraphs: list[OcrParagraph] | None = None,
+) -> np.ndarray:
+    """
+    青色マスクを生成。
+    paragraphsが指定された場合、テキスト領域を消去して
+    引出線だけが残るようにする。
+    """
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     lower_blue = np.array([90, 50, 50])
     upper_blue = np.array([135, 255, 255])
     mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+    # テキスト領域の内側だけ消去（外周フリンジは残して経路接続を保つ）
+    # これにより青テキスト経由のショートカットを防ぎつつ、
+    # 引出線→テキストの接続は維持
+    fringe = 8  # 外周に残すピクセル数
+    if paragraphs:
+        for para in paragraphs:
+            bx = max(0, int(para.bbox.x) + fringe)
+            by = max(0, int(para.bbox.y) + fringe)
+            bx2 = min(mask.shape[1], int(para.bbox.x + para.bbox.w) - fringe)
+            by2 = min(mask.shape[0], int(para.bbox.y + para.bbox.h) - fringe)
+            if bx < bx2 and by < by2:
+                mask[by:by2, bx:bx2] = 0
 
     # 線の途切れを補完
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
@@ -101,9 +121,12 @@ def _bfs_from_point(
 def _min_bfs_dist_to_bbox(
     dist_map: np.ndarray,
     bbox: BBox,
-    margin: float = 5.0,
+    margin: float = 15.0,
 ) -> int:
-    """BFS距離マップ上でBBox内の最小距離を返す。到達不可なら-1。"""
+    """BFS距離マップ上でBBox周辺の最小距離を返す。到達不可なら-1。
+    テキスト領域は青マスクから除去されているので、
+    BBox周辺のマージンで引出線の端を拾う。
+    """
     h, w = dist_map.shape
     x1 = max(0, int(bbox.x - margin))
     y1 = max(0, int(bbox.y - margin))
@@ -115,6 +138,66 @@ def _min_bfs_dist_to_bbox(
     if len(reachable) == 0:
         return -1
     return int(reachable.min())
+
+
+def _hungarian(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    簡易ハンガリアン法（Munkres）。
+    cost: n x n のコスト行列。
+    Returns: (row_indices, col_indices)
+    """
+    n = cost.shape[0]
+    u = np.zeros(n + 1)
+    v = np.zeros(n + 1)
+    p = np.zeros(n + 1, dtype=int)
+    way = np.zeros(n + 1, dtype=int)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(n + 1, np.inf)
+        used = np.zeros(n + 1, dtype=bool)
+
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = np.inf
+            j1 = -1
+
+            for j in range(1, n + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+
+            j0 = j1
+            if p[j0] == 0:
+                break
+
+        while j0:
+            p[j0] = p[way[j0]]
+            j0 = way[j0]
+
+    row_ind = []
+    col_ind = []
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            row_ind.append(p[j] - 1)
+            col_ind.append(j - 1)
+
+    return np.array(row_ind), np.array(col_ind)
 
 
 def detect_leader_lines_and_link(
@@ -129,7 +212,12 @@ def detect_leader_lines_and_link(
     到達可能なparagraphのうち経路距離が最短のものとリンク。
     L字型の引出線も正しく辿れる。
     """
-    mask = _make_blue_mask(img_bgr)
+    # 小さすぎるスリーブ検出を除外（テキスト上の誤検出）
+    min_radius = 7.0
+    valid_indices = [i for i, d in enumerate(sleeve_detections) if d.circle.radius_px >= min_radius]
+
+    # テキスト領域を除去したマスクでBFS（引出線のみ辿る）
+    mask = _make_blue_mask(img_bgr, paragraphs=paragraphs)
 
     # スリーブ注釈っぽいparagraphだけを候補に
     candidate_paras: list[int] = []
@@ -148,7 +236,8 @@ def detect_leader_lines_and_link(
 
     candidates: list[_Candidate] = []
 
-    for si, det in enumerate(sleeve_detections):
+    for si in valid_indices:
+        det = sleeve_detections[si]
         cx = int(round(det.circle.center_px.x))
         cy = int(round(det.circle.center_px.y))
 
@@ -165,18 +254,38 @@ def detect_leader_lines_and_link(
                 bfs_dist=bfs_d,
             ))
 
-    # BFS距離が短い順にgreedy割り当て
-    candidates.sort(key=lambda c: c.bfs_dist)
+    # ハンガリアン法で全体最適割り当て
+    # BFS距離コスト行列を構築
+    sleeve_ids = sorted(set(c.sleeve_idx for c in candidates))
+    para_ids = sorted(set(c.paragraph_idx for c in candidates))
 
-    links: list[SleeveTextLink] = []
-    linked_sleeves: set[int] = set()
-    linked_paragraphs: set[int] = set()
+    if not sleeve_ids or not para_ids:
+        return []
+
+    s_idx_map = {s: i for i, s in enumerate(sleeve_ids)}
+    p_idx_map = {p: i for i, p in enumerate(para_ids)}
+
+    INF = 10_000_000
+    n = max(len(sleeve_ids), len(para_ids))
+    cost = np.full((n, n), INF, dtype=np.float64)
 
     for c in candidates:
-        if c.sleeve_idx in linked_sleeves or c.paragraph_idx in linked_paragraphs:
+        si = s_idx_map[c.sleeve_idx]
+        pi = p_idx_map[c.paragraph_idx]
+        # 同じペアで複数候補がある場合は最小距離を採用
+        if c.bfs_dist < cost[si, pi]:
+            cost[si, pi] = c.bfs_dist
+
+    row_ind, col_ind = _hungarian(cost)
+
+    links: list[SleeveTextLink] = []
+    for r, c_idx in zip(row_ind, col_ind):
+        if cost[r, c_idx] >= INF:
             continue
-        links.append(SleeveTextLink(sleeve_idx=c.sleeve_idx, paragraph_idx=c.paragraph_idx))
-        linked_sleeves.add(c.sleeve_idx)
-        linked_paragraphs.add(c.paragraph_idx)
+        if r < len(sleeve_ids) and c_idx < len(para_ids):
+            links.append(SleeveTextLink(
+                sleeve_idx=sleeve_ids[r],
+                paragraph_idx=para_ids[c_idx],
+            ))
 
     return links

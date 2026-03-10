@@ -24,11 +24,11 @@ TEMPLATE_DIR = PROJECT_ROOT / "docs"
 # テンプレートファイル一覧
 TEMPLATE_FILES = [
     "template1.png",
-    "template2.png",
+    # template2.png: 線つき円 — 非スリーブ要素に誤マッチするため除外
     "template3.png",
     "template4.png",
     "template5.png",
-    "template6.png",
+    # template6.png: 十字つき円 — 非スリーブ要素に誤マッチするため除外
     "template7.png",
     "スリーブ例画像.png",
 ]
