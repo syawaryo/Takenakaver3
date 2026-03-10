@@ -26,10 +26,11 @@ def _detect_lines_morphology(
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     # 先にCLOSEで小さなギャップ（テキストやスリーブによる分断）を埋める
+    # 端部の通り芯はテキストで分断されやすいので少し大きめ(10px)
     if direction == "vertical":
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 10))
     else:
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 1))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
 
     if direction == "vertical":
@@ -166,10 +167,10 @@ def detect_grid_lines(
     results: list[GridLine] = []
 
     for direction in ("vertical", "horizontal"):
-        # 2段階検出: 厳しい閾値 → 端の通り芯用に緩い閾値で補完
+        # 3段階検出: 厳しい閾値 → 緩い閾値 → さらに緩い閾値で端の通り芯を補完
         found_positions: set[int] = set()
 
-        for ratio in [kernel_ratio, kernel_ratio * 0.75]:
+        for ratio in [kernel_ratio, kernel_ratio * 0.75, kernel_ratio * 0.5]:
             line_img = _detect_lines_morphology(work_gray, direction, ratio)
 
             if direction == "vertical":
@@ -177,7 +178,29 @@ def detect_grid_lines(
             else:
                 projection = np.sum(line_img, axis=1) / 255
 
+            # デバッグ: 射影ヒストグラムとモルフォロジー結果を保存
+            try:
+                from pathlib import Path
+                debug_dir = Path("output")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                ratio_str = f"{ratio:.3f}"
+                cv2.imwrite(str(debug_dir / f"debug_grid_{direction}_{ratio_str}.png"), line_img)
+                # 射影ヒストグラムを画像化
+                proj_img = np.ones((300, len(projection)), dtype=np.uint8) * 255
+                if projection.max() > 0:
+                    norm_proj = (projection / projection.max() * 280).astype(int)
+                    for i, val in enumerate(norm_proj):
+                        cv2.line(proj_img, (i, 300), (i, 300 - val), 0, 1)
+                    # 閾値ライン
+                    th_y = 300 - int(0.3 * 280)
+                    cv2.line(proj_img, (0, th_y), (len(projection), th_y), 128, 1)
+                cv2.imwrite(str(debug_dir / f"debug_proj_{direction}_{ratio_str}.png"), proj_img)
+                print(f"       [DEBUG] {direction} ratio={ratio:.3f}: projection max={projection.max():.0f}, threshold={projection.max()*0.3:.0f}")
+            except Exception:
+                pass
+
             peaks = _find_peaks(projection, min_peak_distance)
+            print(f"       [DEBUG] {direction} ratio={ratio:.3f}: peaks={peaks}")
 
             for pos in peaks:
                 # 既に検出済みの近傍はスキップ
@@ -193,7 +216,12 @@ def detect_grid_lines(
                         global_pos, direction, ocr_texts, (h, w)
                     )
 
-                confidence = 0.8 if ratio == kernel_ratio else 0.6
+                if ratio == kernel_ratio:
+                    confidence = 0.8
+                elif ratio == kernel_ratio * 0.75:
+                    confidence = 0.6
+                else:
+                    confidence = 0.4
                 results.append(
                     GridLine(
                         label=label or f"{'V' if direction == 'vertical' else 'H'}-{int(global_pos)}",
