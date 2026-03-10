@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from grid_detector import compute_scale, detect_grid_lines
 from models import (
     FloorSleeveDrawingAnalysis,
+    OcrParagraph,
     OcrText,
     PixelPoint,
     Sleeve,
@@ -96,7 +97,9 @@ def load_image(path: str) -> np.ndarray:
         pil_img = pages[0]
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     else:
-        img = cv2.imread(str(p))
+        # cv2.imread は日本語パスを扱えないので numpy 経由で読み込む
+        buf = np.fromfile(str(p), dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"Cannot read image: {path}")
         return img
@@ -305,10 +308,11 @@ def analyze(
 
     # --- OCR ---
     print("[2/5] Running Azure DI OCR...")
+    ocr_paragraphs: list[OcrParagraph] = []
     try:
         from ocr_extractor import run_azure_ocr
-        ocr_texts = run_azure_ocr(img_bytes, w, h)
-        print(f"       Found {len(ocr_texts)} text elements")
+        ocr_texts, ocr_paragraphs = run_azure_ocr(img_bytes, w, h)
+        print(f"       Found {len(ocr_texts)} text elements, {len(ocr_paragraphs)} paragraphs")
     except Exception as e:
         print(f"       [WARN] OCR failed: {e}")
         ocr_texts = []
@@ -370,112 +374,21 @@ def analyze(
         sleeve_detections = _run_sleeve_detection()
         print("[5/5] Skipping dimension detection (--no-nanobanana)")
 
-    # --- テキスト紐付け + スリーブ構築 ---
-    print("[6/6] Matching text to sleeves...")
-    import re as _re
+    # --- 引出線検出 + テキスト紐付け ---
+    print("[6/6] Detecting leader lines & linking paragraphs to sleeves...")
+    from leader_line_detector import detect_leader_lines_and_link
 
-    # Step 1: スリーブ番号テキスト(SK-xxx)を先にスリーブ円に排他的に割り当て
-    # 各SK-xxxテキストを最も近い円に紐付け
-    sk_pattern = _re.compile(r"[A-Za-z]{1,4}[-\s]?\d{1,4}")
-    sk_texts: list[tuple[int, OcrText]] = []  # (index, text)
-    for ti, t in enumerate(ocr_texts):
-        if sk_pattern.search(t.text.strip()):
-            sk_texts.append((ti, t))
+    links = detect_leader_lines_and_link(img, sleeve_detections, ocr_paragraphs)
+    print(f"       Linked {len(links)} sleeves via leader lines")
 
-    # 各スリーブ検出に最も近いSK-xxxテキストを割り当て
-    sleeve_sk_assignment: dict[int, tuple[int, OcrText]] = {}  # det_idx -> (text_idx, text)
-    claimed_sk: set[int] = set()
-
-    for det_idx, det in enumerate(sleeve_detections):
-        cx, cy = det.circle.center_px.x, det.circle.center_px.y
-        best_dist = 200.0  # 最大検索距離
-        best = None
-        for ti, t in sk_texts:
-            if ti in claimed_sk:
-                continue
-            dist = ((cx - t.position_px.x) ** 2 + (cy - t.position_px.y) ** 2) ** 0.5
-            if dist < best_dist:
-                best_dist = dist
-                best = (ti, t)
-        if best:
-            sleeve_sk_assignment[det_idx] = best
-            claimed_sk.add(best[0])
-
-    # Step 2: SKテキストから同一行のテキストをまとめて取得
-    # 同じy座標 + x座標が連続しているテキストを1行として収集
-    line_y_tolerance = 15   # 同一行とみなすy座標の許容差(px)
-    line_x_gap_max = 150    # x方向の最大ギャップ(px) — これ以上離れていたら別行とみなす
-
-    def _collect_line_texts(anchor_ti: int, anchor_text: OcrText) -> tuple[list[OcrText], set[int]]:
-        """SKテキストと同一行のテキストをx連続性を考慮して収集。"""
-        anchor_y = anchor_text.position_px.y
-        # 同じy座標のテキスト候補を集める
-        candidates: list[tuple[float, int, OcrText]] = [(anchor_text.position_px.x, anchor_ti, anchor_text)]
-        for tj, t2 in enumerate(ocr_texts):
-            if tj == anchor_ti:
-                continue
-            if abs(t2.position_px.y - anchor_y) < line_y_tolerance:
-                candidates.append((t2.position_px.x, tj, t2))
-        # x座標順にソート
-        candidates.sort(key=lambda c: c[0])
-
-        # x連続性チェック: アンカーから左右に連続しているもののみ採用
-        anchor_pos = next(i for i, c in enumerate(candidates) if c[1] == anchor_ti)
-        line: list[tuple[float, int, OcrText]] = [candidates[anchor_pos]]
-        # 右方向
-        for i in range(anchor_pos + 1, len(candidates)):
-            if candidates[i][0] - candidates[i - 1][0] < line_x_gap_max:
-                line.append(candidates[i])
-            else:
-                break
-        # 左方向
-        for i in range(anchor_pos - 1, -1, -1):
-            if candidates[i + 1][0] - candidates[i][0] < line_x_gap_max:
-                line.insert(0, candidates[i])
-            else:
-                break
-
-        line.sort(key=lambda c: c[0])
-        texts = [t for _, _, t in line]
-        indices = {idx for _, idx, _ in line}
-        return texts, indices
-
-    claimed_texts: set[int] = set(claimed_sk)
     sleeves: list[Sleeve] = []
     sleeve_raw_texts: list[str] = []
 
-    for idx, det in enumerate(sleeve_detections):
-        cx, cy = det.circle.center_px.x, det.circle.center_px.y
+    for link in links:
+        det = sleeve_detections[link.sleeve_idx]
+        para = ocr_paragraphs[link.paragraph_idx]
 
-        matched_texts: list[OcrText] = []
-        if idx in sleeve_sk_assignment:
-            sk_ti, sk_text = sleeve_sk_assignment[idx]
-            # SK行を丸ごと取得
-            line_texts, line_indices = _collect_line_texts(sk_ti, sk_text)
-            matched_texts = line_texts
-            claimed_texts.update(line_indices)
-        else:
-            # SKテキストなし → 円の近傍テキストをフォールバック収集
-            nearby: list[tuple[float, int, OcrText]] = []
-            for ti, t in enumerate(ocr_texts):
-                if ti in claimed_texts:
-                    continue
-                dist = ((cx - t.position_px.x) ** 2 + (cy - t.position_px.y) ** 2) ** 0.5
-                if dist < 120.0:
-                    nearby.append((dist, ti, t))
-            nearby.sort(key=lambda c: c[0])
-            for dist, ti, t in nearby[:8]:
-                matched_texts.append(t)
-                claimed_texts.add(ti)
-
-        text_center = None
-        if matched_texts:
-            text_center = PixelPoint(
-                x=matched_texts[0].position_px.x,
-                y=matched_texts[0].position_px.y,
-            )
-
-        raw_text = " ".join(t.text for t in matched_texts)
+        raw_text = para.content
         sleeve_raw_texts.append(raw_text)
         slab_id = _assign_slab_id(det.circle.center_px, grid_lines)
 
@@ -483,10 +396,10 @@ def analyze(
             Sleeve(
                 circle=det.circle,
                 raw_text=raw_text,
-                text_position_px=text_center,
+                text_position_px=para.center_px,
                 parsed=SleeveAnnotationParsed(),
                 slab_id=slab_id,
-                detection_id=f"DET-{idx + 1:03d}",
+                detection_id=f"DET-{link.sleeve_idx + 1:03d}",
                 confidence=det.circle.circularity * det.circle.color_confidence,
             )
         )

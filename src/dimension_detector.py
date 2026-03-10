@@ -93,7 +93,9 @@ def _load_connect_templates() -> list[tuple[str, np.ndarray]]:
         if not path.exists():
             print(f"       [WARN] Connect template not found: {path}")
             continue
-        bgr = cv2.imread(str(path))
+        # cv2.imread は日本語パスを扱えないので numpy 経由で読み込む
+        buf = np.fromfile(str(path), dtype=np.uint8)
+        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if bgr is None:
             print(f"       [WARN] Cannot read connect template: {path}")
             continue
@@ -138,7 +140,8 @@ def detect_dimension_points(
     # 旧テンプレートもフォールバックとして追加
     old_path = Path(template_path)
     if old_path.exists():
-        old_tmpl = cv2.imread(str(old_path))
+        buf = np.fromfile(str(old_path), dtype=np.uint8)
+        old_tmpl = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if old_tmpl is not None:
             templates.append(("legacy_template", _remove_blue(old_tmpl)))
 

@@ -29,6 +29,7 @@ TEMPLATE_FILES = [
     "template4.png",
     "template5.png",
     "template6.png",
+    "template7.png",
     "スリーブ例画像.png",
 ]
 
@@ -77,7 +78,9 @@ def _load_templates(
         if not path.exists():
             print(f"       [WARN] Template not found: {path}")
             continue
-        bgr = cv2.imread(str(path))
+        # cv2.imread は日本語パスを扱えないので numpy 経由で読み込む
+        buf = np.fromfile(str(path), dtype=np.uint8)
+        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if bgr is None:
             print(f"       [WARN] Cannot read template: {path}")
             continue

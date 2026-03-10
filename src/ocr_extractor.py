@@ -12,7 +12,7 @@ import os
 
 from dotenv import load_dotenv
 
-from models import BBox, OcrText, PixelPoint
+from models import BBox, OcrParagraph, OcrText, PixelPoint
 
 load_dotenv()
 
@@ -51,7 +51,7 @@ def run_azure_ocr(
     image_bytes: bytes,
     img_width: int,
     img_height: int,
-) -> list[OcrText]:
+) -> tuple[list[OcrText], list[OcrParagraph]]:
     """
     Azure Document Intelligence でOCR実行。
 
@@ -63,7 +63,7 @@ def run_azure_ocr(
 
     Returns
     -------
-    OcrText のリスト（ピクセル座標付き）
+    (OcrText のリスト, OcrParagraph のリスト)
     """
     from azure.ai.documentintelligence import DocumentIntelligenceClient
     from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
@@ -85,9 +85,10 @@ def run_azure_ocr(
     result = poller.result()
 
     texts: list[OcrText] = []
+    paragraphs: list[OcrParagraph] = []
 
     if not result.pages:
-        return _postprocess_ocr(texts)
+        return _postprocess_ocr(texts), paragraphs
 
     page = result.pages[0]
     # ページサイズ（インチ）
@@ -98,6 +99,7 @@ def run_azure_ocr(
     scale_x = img_width / page_w_inch
     scale_y = img_height / page_h_inch
 
+    # --- words ---
     if page.words:
         for word in page.words:
             if not word.polygon or len(word.polygon) < 8:
@@ -128,7 +130,43 @@ def run_azure_ocr(
                 )
             )
 
-    return _postprocess_ocr(texts)
+    # --- paragraphs ---
+    if result.paragraphs:
+        for para in result.paragraphs:
+            if not para.bounding_regions:
+                continue
+            br = para.bounding_regions[0]
+            if not br.polygon or len(br.polygon) < 8:
+                continue
+
+            bbox_inch, center_inch = _polygon_to_bbox_and_center(
+                br.polygon, img_width, img_height
+            )
+            bbox_px = BBox(
+                x=bbox_inch.x * scale_x,
+                y=bbox_inch.y * scale_y,
+                w=bbox_inch.w * scale_x,
+                h=bbox_inch.h * scale_y,
+            )
+            center_px = PixelPoint(
+                x=center_inch.x * scale_x,
+                y=center_inch.y * scale_y,
+            )
+
+            # paragraph テキストにもOCR補正を適用
+            content = para.content or ""
+            for old, new in _OCR_REPLACEMENTS:
+                content = content.replace(old, new)
+
+            paragraphs.append(
+                OcrParagraph(
+                    content=content,
+                    bbox=bbox_px,
+                    center_px=center_px,
+                )
+            )
+
+    return _postprocess_ocr(texts), paragraphs
 
 
 # 図面特有のOCR誤読パターン
