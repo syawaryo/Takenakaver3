@@ -101,7 +101,7 @@ if uploaded is not None:
                 # ============================================
                 # チェックリスト審査
                 # ============================================
-                from checklist_checker import run_checklist
+                from src.checklist_checker import run_checklist
 
                 report = run_checklist(result)
 

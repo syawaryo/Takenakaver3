@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from models import (
+from src.models import (
     ChecklistReport,
     CheckResult,
     FloorSleeveDrawingAnalysis,
