@@ -123,3 +123,26 @@ class FloorSleeveDrawingAnalysis(BaseModel):
 
     px_per_mm: Optional[float] = Field(None, description="ピクセル/mm変換係数")
     analyzed_at: datetime = Field(default_factory=datetime.now)
+
+
+# ==========================================================================
+# チェックリスト審査結果
+# ==========================================================================
+
+class CheckResult(BaseModel):
+    """個別チェック項目の結果"""
+    item_id: str = Field(..., description="チェック項目ID")
+    title: str = Field(..., description="チェック項目名")
+    status: str = Field(..., description="'OK' / 'NG' / 'WARN' / 'SKIP'")
+    detail: str = Field("", description="詳細説明")
+    targets: list[str] = Field(default_factory=list, description="対象スリーブID等")
+
+
+class ChecklistReport(BaseModel):
+    """チェックリスト審査レポート"""
+    checks: list[CheckResult] = Field(default_factory=list)
+    total: int = 0
+    ok_count: int = 0
+    ng_count: int = 0
+    warn_count: int = 0
+    skip_count: int = 0

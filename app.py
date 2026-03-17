@@ -77,15 +77,15 @@ if uploaded is not None:
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.subheader("元画像")
-                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width="stretch")
+                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
                 with col2:
                     st.subheader("検出結果オーバーレイ")
-                    st.image(overlay_rgb, width="stretch")
+                    st.image(overlay_rgb, use_container_width=True)
                 with col3:
                     st.subheader("再構成マップ")
                     h_img, w_img = img.shape[:2]
                     recon = draw_reconstruction_map(w_img, h_img, result)
-                    st.image(cv2.cvtColor(recon, cv2.COLOR_BGR2RGB), width="stretch")
+                    st.image(cv2.cvtColor(recon, cv2.COLOR_BGR2RGB), use_container_width=True)
 
                 # サマリー
                 st.divider()
@@ -98,7 +98,47 @@ if uploaded is not None:
                 if result.px_per_mm:
                     st.info(f"スケール: {result.px_per_mm:.4f} px/mm")
 
+                # ============================================
+                # チェックリスト審査
+                # ============================================
+                from checklist_checker import run_checklist
+
+                report = run_checklist(result)
+
+                st.divider()
+                st.subheader("施工図チェックリスト審査")
+
+                # サマリーメトリクス
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("OK", report.ok_count)
+                rc2.metric("NG", report.ng_count)
+                rc3.metric("WARN", report.warn_count)
+                rc4.metric("SKIP（検証不可）", report.skip_count)
+
+                # 検証可能な項目の結果
+                STATUS_ICON = {"OK": "✅", "NG": "❌", "WARN": "⚠️", "SKIP": "⏭️"}
+
+                # NG/WARN を先に表示
+                verifiable = [c for c in report.checks if c.status != "SKIP"]
+                skipped = [c for c in report.checks if c.status == "SKIP"]
+
+                for chk in verifiable:
+                    icon = STATUS_ICON.get(chk.status, "")
+                    with st.expander(
+                        f"{icon} [{chk.item_id}] {chk.title} — {chk.status}",
+                        expanded=(chk.status == "NG"),
+                    ):
+                        st.write(chk.detail)
+                        if chk.targets:
+                            st.write("**対象:**", ", ".join(chk.targets))
+
+                with st.expander("検証不可項目（参考データ不足）", expanded=False):
+                    for chk in skipped:
+                        st.write(f"⏭️ **[{chk.item_id}] {chk.title}**: {chk.detail}")
+
+                # ============================================
                 # スリーブ一覧テーブル
+                # ============================================
                 if result.sleeves:
                     st.subheader("スリーブ一覧")
                     rows = []
@@ -109,12 +149,14 @@ if uploaded is not None:
                             "用途": s.parsed.purpose or "",
                             "呼び径": s.parsed.nominal_size or "",
                             "口径": s.parsed.bore_diameter or "",
+                            "外径": s.parsed.outer_diameter or "",
+                            "基準レベル": s.parsed.level_reference or "",
                             "スラブID": s.slab_id or "",
                             "X (px)": f"{s.circle.center_px.x:.0f}",
                             "Y (px)": f"{s.circle.center_px.y:.0f}",
                             "信頼度": f"{s.confidence:.2f}",
                         })
-                    st.dataframe(rows, width="stretch")
+                    st.dataframe(rows, use_container_width=True)
 
                 # JSON ダウンロード
                 st.subheader("結果JSON")
